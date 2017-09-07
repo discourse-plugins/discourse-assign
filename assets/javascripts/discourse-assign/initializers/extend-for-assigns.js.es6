@@ -1,23 +1,57 @@
 import { withPluginApi } from 'discourse/lib/plugin-api';
-import { observes } from 'ember-addons/ember-computed-decorators';
-
+import { default as computed, observes, on } from 'ember-addons/ember-computed-decorators';
 
 // should this be in API ?
-import Topic from 'discourse/models/topic';
-import TopicFooterDropdown from 'discourse/components/topic-footer-mobile-dropdown';
 import showModal from 'discourse/lib/show-modal';
+import { iconNode } from 'discourse-common/lib/icon-library';
+import { h } from 'virtual-dom';
 
-function initialize(api, container) {
+function initialize(api) {
 
-  const siteSettings = container.lookup('site-settings:main');
-  const currentUser = container.lookup('current-user:main');
+  // You can't act on flags claimed by another user
+  api.modifyClass('component:flagged-post', {
+    _canAct: null,
+
+    init() {
+      this._super();
+      this._canAct = this.get('canAct');
+      this.updateAssigned();
+    },
+
+    didInsertElement() {
+      this._super();
+      if (!this._canAct) { return; }
+
+      this.messageBus.subscribe("/staff/topic-assignment", data => {
+        if (data.topic_id === this.get('flaggedPost.topic.id')) {
+          if (data.type === 'assigned') {
+            this.set('flaggedPost.topic.assigned_to_user_id', data.assigned_to.id);
+          } else {
+            this.set('flaggedPost.topic.assigned_to_user_id', null);
+          }
+        }
+      });
+    },
+
+    @observes('flaggedPost.topic.assigned_to_user_id')
+    updateAssigned() {
+      let userId = this.currentUser.get('id');
+      let assignedToUserId = this.get('flaggedPost.topic.assigned_to_user_id');
+      this.set('canAct', this._canAct && ((assignedToUserId || userId) === userId));
+    },
+
+    willDestroyElement() {
+      this._super();
+      this.messageBus.unsubscribe("/staff/topic-assignment");
+    }
+  });
 
   // doing this mess while we come up with a better API
-  TopicFooterDropdown.reopen({
+  api.modifyClass('component:topic-footer-mobile-dropdown', {
     _createContent() {
       this._super();
 
-      if (!this.get('currentUser.staff') || !siteSettings.assign_enabled) {
+      if (!this.get('currentUser.staff') || !this.siteSettings.assign_enabled) {
         return;
       }
       const content = this.get('content');
@@ -48,16 +82,20 @@ function initialize(api, container) {
     }
   });
 
-  Topic.reopen({
-    assignedToUserPath: function(){
-      return siteSettings.assigns_user_url_path.replace("{username}", this.get("assigned_to_user.username"));
-    }.property('assigned_to_user')
+  api.modifyClass('model:topic', {
+    @computed('assigned_to_user')
+    assignedToUserPath(assignedToUser) {
+      return this.siteSettings.assigns_user_url_path.replace(
+        "{username}",
+        Ember.get(assignedToUser, 'username')
+      );
+    }
   });
 
   api.addPostSmallActionIcon('assigned','user-plus');
   api.addPostSmallActionIcon('unassigned','user-times');
 
-  api.addPostTransformCallback((transformed) => {
+  api.addPostTransformCallback(transformed => {
     if (transformed.actionCode === "assigned" || transformed.actionCode === "unassigned") {
       transformed.isSmallAction = true;
       transformed.canEdit = false;
@@ -75,14 +113,33 @@ function initialize(api, container) {
 
   });
 
-  if (currentUser && currentUser.get("staff") && siteSettings.assign_enabled) {
-    api.addUserMenuGlyph({
-      label: 'discourse_assign.assigned',
-      className: 'assigned',
-      icon: 'user-plus',
-      href: `${currentUser.get("path")}/activity/assigned`
-    });
-  }
+  api.addUserMenuGlyph(widget => {
+    return undefined;
+
+    if (widget.currentUser &&
+        widget.currentUser.get('staff') &&
+        widget.siteSettings.assign_enabled) {
+
+      return {
+        label: 'discourse_assign.assigned',
+        className: 'assigned',
+        icon: 'user-plus',
+        href: `${widget.currentUser.get("path")}/activity/assigned`,
+      };
+    }
+  });
+
+  api.createWidget('assigned-to', {
+    html(attrs) {
+      let { assignedToUser, href } = attrs;
+
+      return h('p.assigned-to', [
+        iconNode('user-plus'),
+        h('span.assign-text', I18n.t('discourse_assign.assigned_to')),
+        h('a', { attributes: { class: 'assigned-to-username', href } }, assignedToUser.username)
+      ]);
+    }
+  });
 
   api.decorateWidget('post-contents:after-cooked', dec => {
     if (dec.attrs.post_number === 1) {
@@ -90,22 +147,19 @@ function initialize(api, container) {
       if (postModel) {
         const assignedToUser = postModel.get('topic.assigned_to_user');
         if (assignedToUser) {
-          const path = postModel.get('topic.assignedToUserPath');
-          const userLink = `<a href='${path}'>${assignedToUser.username}</a>`;
-          const html = I18n.t('discourse_assign.assign_html', {userLink});
-          return dec.rawHtml(html);
+          return dec.widget.attach('assigned-to', {
+            assignedToUser,
+            href: postModel.get('topic.assignedToUserPath')
+          });
         }
       }
     }
-
   });
 };
 
 export default {
   name: 'extend-for-assign',
   initialize(container) {
-    withPluginApi('0.8.5', api => {
-      initialize(api, container);
-    });
+    withPluginApi('0.8.10', api => initialize(api, container));
   }
 };
